@@ -15,6 +15,7 @@ import re
 from .clarity import analyze, analyze_action, _check_uncertainty, _remove_uncertainty, all_actions_are_pronoun_based
 from .extractor import extract
 from .clarifier import clarify
+from .llm import call_llm
 
 
 # Common conversational fillers and polite phrases to remove
@@ -100,6 +101,26 @@ def _clean_action(action: str) -> str:
     return cleaned
 
 
+def _should_use_llm(result: dict, clarification_threshold: int = 2) -> bool:
+    """
+    Decide whether the rule-based result is good enough or needs LLM fallback.
+
+    Fallback is triggered when:
+    - No actions were extracted (rule-based couldn't parse the instruction), OR
+    - Too many clarifications (high ambiguity the rules couldn't resolve)
+
+    Args:
+        result: The rule-based pipeline output dict.
+        clarification_threshold: Max acceptable clarifications before falling back.
+
+    Returns:
+        True if LLM fallback should be used.
+    """
+    no_actions = len(result.get("actions", [])) == 0
+    too_many_clarifications = len(result.get("clarifications", [])) >= clarification_threshold
+    return no_actions or too_many_clarifications
+
+
 def run(instruction: str) -> dict:
     """
     Process a user instruction and return a structured response.
@@ -170,10 +191,17 @@ def run(instruction: str) -> dict:
 
     print("STATUS:", status)
 
-    return {
+    rule_based_result = {
         "status": status,
         "actions": final_actions,
         "deadline": extraction["deadline"],
         "priority": extraction["priority"],
-        "clarifications": list(dict.fromkeys(all_clarifications)),  # deduplicate
+        "clarifications": list(dict.fromkeys(all_clarifications)),
     }
+
+    # Hybrid decision: fall back to LLM if rule-based result is insufficient
+    if _should_use_llm(rule_based_result):
+        print("FALLBACK: rule-based insufficient, calling LLM...")
+        return call_llm(instruction)
+
+    return rule_based_result
