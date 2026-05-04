@@ -13,7 +13,7 @@ Features:
 import json
 import logging
 import os
-from openai import OpenAI
+from google import genai
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -21,12 +21,15 @@ from openai import OpenAI
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Client
+# Client — reads GEMINI_API_KEY from environment
 # ---------------------------------------------------------------------------
-_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+api_key = os.environ.get("GEMINI_API_KEY")
+if not api_key:
+    raise ValueError("GEMINI_API_KEY not set")
+_client = genai.Client(api_key=api_key)
 
-# gpt-4o-mini: stable, cost-efficient, and widely supported — ideal for production use
-_MODEL = "gpt-4o-mini"
+# gemini-2.0-flash: fast, cost-efficient, and widely supported Gemini model
+_MODEL = "gemini-2.0-flash"
 _TEMPERATURE = 0.2
 _MAX_RETRIES = 2
 
@@ -141,11 +144,15 @@ def _apply_safe_defaults(data: dict) -> dict:
     Coerce a partially valid dict into a fully valid response
     by filling missing or wrong-typed fields with safe defaults.
     """
+    priority = data.get("priority")
+    if priority not in _VALID_PRIORITIES:
+        priority = "medium"
+
     return {
         "status": data.get("status") if data.get("status") in _VALID_STATUSES else "needs_clarification",
         "actions": data.get("actions") if isinstance(data.get("actions"), list) else [],
         "deadline": data.get("deadline") if isinstance(data.get("deadline"), (str, type(None))) else None,
-        "priority": data.get("priority") if isinstance(data.get("priority"), (str, type(None))) else None,
+        "priority": priority,
         "clarifications": data.get("clarifications") if isinstance(data.get("clarifications"), list) else [],
     }
 
@@ -177,16 +184,16 @@ def _parse_response(raw: str) -> dict:
 
 
 def _call_once(instruction: str) -> str:
-    """Make a single API call and return the raw response string."""
-    response = _client.chat.completions.create(
+    """Make a single Gemini API call and return the raw response string."""
+    prompt = f"{_SYSTEM_PROMPT}\n\nInstruction: {instruction.strip()}"
+    response = _client.models.generate_content(
         model=_MODEL,
-        temperature=_TEMPERATURE,
-        messages=[
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": instruction.strip()},
-        ],
+        contents=prompt,
     )
-    return response.choices[0].message.content.strip()
+    text = getattr(response, "text", None)
+    if not text:
+        raise ValueError("Empty response from Gemini")
+    return text.strip()
 
 
 # ---------------------------------------------------------------------------

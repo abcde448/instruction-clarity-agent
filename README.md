@@ -1,6 +1,6 @@
 # Instruction Clarity Agent
 
-A modular, rule-based Python agent that processes natural language instructions and either extracts actionable tasks or asks targeted clarification questions — all without any external NLP libraries.
+A modular Python agent that processes natural language instructions and either extracts actionable tasks or asks targeted clarification questions. Combines a rule-based pipeline with a Google Gemini LLM fallback for a hybrid AI architecture — no external NLP libraries required for the rule-based layer.
 
 ---
 
@@ -13,7 +13,8 @@ agent/
 ├── clarity.py        # Clarity analysis and uncertainty detection
 ├── extractor.py      # Action, deadline, and priority extraction
 ├── clarifier.py      # Clarification question generation
-├── analyzer.py       # (Legacy) Full-instruction clarity analyzer
+├── analyzer.py       # Full-instruction clarity analyzer
+├── llm.py            # Google Gemini LLM fallback module
 └── models.py         # Shared Pydantic models
 main.py               # Terminal entry point
 requirements.txt      # Dependencies
@@ -23,26 +24,36 @@ requirements.txt      # Dependencies
 
 ## How It Works
 
-Every instruction goes through this pipeline:
+### Hybrid Pipeline
 
 ```
 Raw input
    ↓
-1. Noise removal       — strips "hey", "bro", "can you", "please", etc.
+1. Noise removal        — strips "hey", "bro", "can you", "please", etc.
    ↓
-2. Uncertainty removal — strips "maybe", "if possible", "possibly", etc.
+2. Uncertainty removal  — strips "maybe", "if possible", "possibly", etc.
    ↓
-3. Action extraction   — splits into individual actions, detects deadline + priority
+3. Action extraction    — splits into actions, detects deadline + priority
    ↓
-4. Action validation   — checks each action for vague pronouns, missing verbs, etc.
+4. Action validation    — checks each action for vague pronouns, missing verbs
    ↓
 5. Decision
       ├── All actions pronoun-only?  → needs_clarification, actions = []
       ├── Valid actions exist?       → complete, return all actions
       └── No actions at all?        → needs_clarification, actions = []
    ↓
-6. Clarifications built separately — never block valid actions
+6. Hybrid check
+      ├── No actions extracted OR too many clarifications (≥2)?
+      │       → call Gemini LLM fallback
+      └── Rule-based result is sufficient?
+              → return rule-based result
 ```
+
+### LLM Fallback Trigger
+
+The LLM is called when the rule-based pipeline produces:
+- No extracted actions, OR
+- 2 or more clarification questions (high ambiguity)
 
 ---
 
@@ -120,33 +131,19 @@ Output:
 }
 ```
 
-### Partially ambiguous instruction
-```
-Input:  "prepare report and send it to the client"
-
-Output:
-{
-  "status": "complete",
-  "actions": ["prepare report", "send it to the client"],
-  "deadline": null,
-  "priority": "medium",
-  "clarifications": ["What does 'it' refer to?"]
-}
-```
-
-### Fully unclear instruction
+### Partially ambiguous — LLM fallback triggered
 ```
 Input:  "fix it somehow"
 
-Output:
+Output (via Gemini):
 {
   "status": "needs_clarification",
   "actions": [],
   "deadline": null,
   "priority": null,
   "clarifications": [
-    "What does 'it' refer to?",
-    "How exactly should 'fix it somehow' be done?"
+    "What specifically needs to be fixed?",
+    "What does 'it' refer to?"
   ]
 }
 ```
@@ -170,38 +167,50 @@ Output:
 ## Modules
 
 ### `agent.py` — Controller
-Orchestrates the full pipeline. Entry point is `run(instruction: str) -> dict`.
+Orchestrates the full hybrid pipeline. Entry point is `run(instruction: str) -> dict`.
 
 Key functions:
 - `_clean_noise(text)` — removes conversational filler phrases and words
 - `_clean_action(action)` — cleans individual extracted actions
+- `_should_use_llm(result)` — decides whether to fall back to LLM
 - `run(instruction)` — main pipeline function
 
 ### `clarity.py` — Clarity Analysis
 Assesses instructions and individual actions for clarity.
 
 Key functions:
-- `analyze(text)` — full instruction clarity check, returns `{is_clear, missing_fields}`
+- `analyze(text)` — full instruction clarity check
 - `analyze_action(action)` — per-action check, returns targeted clarification questions
-- `_check_uncertainty(text)` — detects uncertainty markers, returns `(bool, [questions])`
+- `_check_uncertainty(text)` — detects uncertainty markers
 - `_remove_uncertainty(text)` — strips uncertainty words from text
-- `all_actions_are_pronoun_based(actions)` — returns True if every action has only pronouns as its object
+- `all_actions_are_pronoun_based(actions)` — detects pronoun-only instructions
 
 ### `extractor.py` — Extraction
 Extracts actions, deadline, and priority from a cleaned instruction.
 
 Key functions:
 - `extract(instruction)` — public interface, returns `{actions, deadline, priority}`
-- `_extract_deadline(text)` — detects relative (`within 2 days`, `in 3 hours`) and fixed (`tomorrow`, `next week`) deadlines
+- `_extract_deadline(text)` — detects relative and fixed deadline expressions
 - `_infer_priority(text)` — infers `high`, `medium`, or `low` from keywords
-- `_split_into_actions(text)` — splits compound instructions into individual action phrases
+- `_split_into_actions(text)` — splits compound instructions into action phrases
 
 ### `clarifier.py` — Clarification Generation
 Generates human-like clarification questions from missing fields.
 
 Key functions:
-- `clarify(missing_fields)` — maps field names to targeted questions, returns `{clarifications}`
-- `generate_clarifications(instruction)` — pattern-based question generation for full instructions
+- `clarify(missing_fields)` — maps field names to targeted questions
+- `generate_clarifications(instruction)` — pattern-based question generation
+
+### `llm.py` — Gemini LLM Fallback
+Calls Google Gemini API with retry logic, schema validation, and safe fallback.
+
+Key functions:
+- `call_llm(instruction)` — public interface, returns validated structured dict
+- `is_valid_schema(data)` — validates all 5 required keys and types
+- `_apply_safe_defaults(data)` — coerces partial responses into valid shape
+- `_parse_response(raw)` — parses JSON, validates schema, applies defaults
+- `_call_once(instruction)` — single Gemini API call
+- `run_tests()` — built-in test runner
 
 ### `models.py` — Data Models
 Pydantic models for structured I/O:
@@ -211,9 +220,36 @@ Pydantic models for structured I/O:
 
 ---
 
-## Deadline Detection
+## LLM Module Details
 
-Supports both relative and fixed time expressions:
+### Provider
+Google Gemini via the `google-genai` SDK (`gemini-2.0-flash` model).
+
+### Reliability Features
+| Feature | Detail |
+|---|---|
+| Retry on JSON failure | Up to 2 retries |
+| Schema validation | All 5 keys checked with correct types |
+| Safe defaults | Missing/wrong-typed fields auto-corrected |
+| Priority normalization | Invalid values default to `"medium"` |
+| Empty response guard | Raises `ValueError` if Gemini returns no text |
+| API key validation | Raises `ValueError` at startup if key is missing |
+| Fallback response | Always returned on unrecoverable failure |
+
+### Fallback Response
+```json
+{
+  "status": "needs_clarification",
+  "actions": [],
+  "deadline": null,
+  "priority": null,
+  "clarifications": ["Could you please rephrase the instruction?"]
+}
+```
+
+---
+
+## Deadline Detection
 
 | Input | Extracted Deadline |
 |---|---|
@@ -254,7 +290,18 @@ pip install -r requirements.txt
 **requirements.txt**
 ```
 pydantic>=2.0
+google-genai>=1.0
 ```
+
+---
+
+## Environment Setup
+
+```bash
+export GEMINI_API_KEY=your_gemini_api_key_here
+```
+
+The agent will raise a `ValueError` at startup if `GEMINI_API_KEY` is not set.
 
 ---
 
@@ -280,12 +327,18 @@ print(result)
 # }
 ```
 
+### Test LLM module directly
+```bash
+python -m agent.llm
+```
+
 ---
 
 ## Design Principles
 
-- **No external NLP libraries** — fully rule-based, no spaCy, NLTK, or transformers
-- **Modular** — each concern is isolated in its own file
+- **Hybrid architecture** — rule-based pipeline runs first; LLM is a fallback, not the default
+- **No external NLP libraries** — rule-based layer uses only Python stdlib + regex
 - **Non-destructive validation** — actions are never dropped due to ambiguity; clarifications are generated instead
-- **Partial success** — mixed instructions (some clear, some vague) return valid actions alongside clarification questions
+- **Partial success** — mixed instructions return valid actions alongside clarification questions
 - **Stateless** — every call to `run()` is fully independent with no shared state
+- **Production-safe LLM** — retry, schema validation, safe defaults, and fallback on every LLM call
